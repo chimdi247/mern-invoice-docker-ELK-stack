@@ -1,0 +1,36 @@
+{
+  "index_patterns": ["invoice-logs-*"],
+  "priority": 200,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index.lifecycle.name": "invoice-logs-14d"
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "@timestamp":     { "type": "date" },
+        "timestamp":      { "type": "date" },
+        "level":          { "type": "keyword" },
+        "service":        { "type": "keyword" },
+        "environment":    { "type": "keyword" },
+        "container_name": { "type": "keyword" },
+        "container_id":   { "type": "keyword" },
+        "source":         { "type": "keyword" },
+        "trace_id":       { "type": "keyword" },
+        "span_id":        { "type": "keyword" },
+        "method":         { "type": "keyword" },
+        "route":          { "type": "keyword" },
+        "path":           { "type": "keyword" },
+        "status_code":    { "type": "integer" },
+        "duration_ms":    { "type": "long" },
+        "content_length": { "type": "long" },
+        "template":       { "type": "keyword" },
+        "message":        { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } } },
+        "stack":          { "type": "text" },
+        "log":            { "type": "text" }
+      }
+    }
+  }
+}

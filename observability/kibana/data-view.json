@@ -1,0 +1,9 @@
+{
+  "data_view": {
+    "id": "invoice-logs",
+    "title": "invoice-logs-*",
+    "name": "Invoice App logs",
+    "timeFieldName": "@timestamp"
+  },
+  "override": true
+}

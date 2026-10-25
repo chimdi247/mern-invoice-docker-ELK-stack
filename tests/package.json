@@ -1,0 +1,30 @@
+{
+  "name": "mern-invoice-tests",
+  "private": true,
+  "description": "Unit, integration, Cypress e2e, Selenium and k6 performance tests for MERN Invoice",
+  "scripts": {
+    "test:unit": "vitest run --config vitest.config.ts",
+    "test:unit:watch": "vitest --config vitest.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:e2e": "cypress run",
+    "test:e2e:open": "cypress open",
+    "test:selenium": "vitest run --config vitest.selenium.config.ts",
+    "perf:smoke": "bash scripts/run-k6.sh smoke",
+    "perf:load": "bash scripts/run-k6.sh load",
+    "perf:stress": "bash scripts/run-k6.sh stress",
+    "perf:spike": "bash scripts/run-k6.sh spike",
+    "perf:soak": "bash scripts/run-k6.sh soak",
+    "perf:breakpoint": "bash scripts/run-k6.sh breakpoint",
+    "perf:pdf": "bash scripts/run-k6.sh pdf",
+    "stack:test": "docker compose -f ../docker-compose.yml -f docker-compose.tests.yml up -d --build api web"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.6",
+    "cypress": "^15.4.0",
+    "jsdom": "^27.0.0",
+    "selenium-webdriver": "^4.36.0",
+    "@types/selenium-webdriver": "^4.1.28",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

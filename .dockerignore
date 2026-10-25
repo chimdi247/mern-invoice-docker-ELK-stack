@@ -1,0 +1,15 @@
+.git
+.gitignore
+**/node_modules
+**/dist
+**/.DS_Store
+.env
+.env.*
+!.env.example
+client
+tests
+observability
+docker
+docker-compose*.yml
+uploads
+*.log

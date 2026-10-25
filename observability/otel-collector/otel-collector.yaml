@@ -1,0 +1,131 @@
+# OpenTelemetry Collector (contrib): single ingestion point for application + infrastructure metrics.
+#
+#   invoice-api (OTLP)   --metrics--> Mimir  (prometheus remote write, S3 backed)
+#   invoice-api (OTLP)   --traces---> spanmetrics connector -> RED metrics for DB / HTTP operations -> Mimir
+#   cAdvisor, node-exporter, blackbox, fluent-bit  (scraped here)  --> Mimir
+#
+# Structured logs do NOT go through the Collector: they are written to stdout, collected by the
+# docker fluentd log driver, parsed by Fluent Bit and indexed in Elasticsearch (see observability/fluent-bit).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  prometheus:
+    config:
+      global:
+        scrape_interval: 15s
+        scrape_timeout: 10s
+      scrape_configs:
+        - job_name: cadvisor            # per-container CPU / memory / network
+          static_configs:
+            - targets: ["cadvisor:8080"]
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: container_(cpu_usage_seconds_total|cpu_cfs_throttled_periods_total|cpu_cfs_periods_total|memory_working_set_bytes|memory_usage_bytes|memory_rss|spec_memory_limit_bytes|spec_cpu_quota|spec_cpu_period|network_receive_bytes_total|network_transmit_bytes_total|last_seen|start_time_seconds)
+              action: keep
+            - source_labels: [name]       # drop cgroups that are not docker containers
+              regex: ".+"
+              action: keep
+
+        - job_name: node-exporter       # host / node CPU, memory, disk, load
+          static_configs:
+            - targets: ["node-exporter:9100"]
+
+        - job_name: fluent-bit          # log pipeline throughput / errors
+          metrics_path: /api/v2/metrics/prometheus
+          static_configs:
+            - targets: ["fluent-bit:2020"]
+
+        # ---- Uptime / availability: black-box probes ----
+        - job_name: blackbox-http
+          metrics_path: /probe
+          params:
+            module: [http_2xx]
+          static_configs:
+            - targets: ["http://api:1997/health"]
+              labels: {service: api}
+            - targets: ["http://web:8080/healthz"]
+              labels: {service: web}
+            - targets: ["http://elasticsearch:9200/_cluster/health"]
+              labels: {service: elasticsearch}
+            - targets: ["http://kibana:5601/api/status"]
+              labels: {service: kibana}
+            - targets: ["http://mimir:9009/ready"]
+              labels: {service: mimir}
+            - targets: ["http://grafana:3000/api/health"]
+              labels: {service: grafana}
+          relabel_configs:
+            - source_labels: [__address__]
+              target_label: __param_target
+            - source_labels: [__param_target]
+              target_label: instance
+            - target_label: __address__
+              replacement: blackbox-exporter:9115
+
+        - job_name: blackbox-tcp
+          metrics_path: /probe
+          params:
+            module: [tcp_connect]
+          static_configs:
+            - targets: ["mongodb:27017"]
+              labels: {service: mongodb}
+          relabel_configs:
+            - source_labels: [__address__]
+              target_label: __param_target
+            - source_labels: [__param_target]
+              target_label: instance
+            - target_label: __address__
+              replacement: blackbox-exporter:9115
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch:
+    timeout: 5s
+    send_batch_size: 2048
+
+connectors:
+  # RED metrics derived from spans (incl. MongoDB client spans):
+  #   traces_span_metrics_calls_total, traces_span_metrics_duration_milliseconds_bucket
+  spanmetrics:
+    namespace: traces.span.metrics
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2500ms, 5s, 10s]
+    dimensions:
+      - name: db.system
+      - name: db.operation
+      - name: db.operation.name
+      - name: db.mongodb.collection
+      - name: http.route
+
+exporters:
+  prometheusremotewrite:
+    endpoint: http://mimir:9009/api/v1/push
+    tls:
+      insecure: true
+    # service.name -> `job` label, service.instance.id -> `instance` (other resource attributes stay out of labels)
+    resource_to_telemetry_conversion:
+      enabled: false
+    add_metric_suffixes: true
+    send_metadata: true
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [spanmetrics]
+    metrics:
+      receivers: [otlp, prometheus, spanmetrics]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite]

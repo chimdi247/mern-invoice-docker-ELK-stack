@@ -1,0 +1,25 @@
+# dependencies / build output
+node_modules
+dist
+client/dist
+coverage
+
+# env + secrets
+.env
+.env.local
+
+# logs / runtime
+logs
+*.log
+uploads
+
+# editors / OS
+.vscode
+.idea
+.DS_Store
+
+# tests
+tests/node_modules
+tests/cypress/videos
+tests/cypress/screenshots
+tests/reports

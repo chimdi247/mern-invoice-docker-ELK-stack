@@ -1,0 +1,419 @@
+# =============================================================================================
+# MERN Invoice - the whole system in ONE compose file
+#
+#   cp .env.example .env      # fill in the secrets (JWT keys, Gmail app password, ...)
+#   docker compose up -d --build
+#
+#   App (React + API via nginx) .. http://localhost:8080
+#   Grafana (metrics, alerts) .... http://localhost:3000      admin / admin (GRAFANA_ADMIN_*)
+#   Kibana (structured logs) ..... http://localhost:5601      Discover -> "Invoice App logs"
+#   MinIO console (S3) ........... http://localhost:9001
+#   Mongo Express (optional) ..... docker compose --profile tools up -d    -> http://localhost:8081
+#   MailHog (optional) ........... docker compose --profile mailhog up -d  -> http://localhost:8025
+#
+# Linux host: Elasticsearch needs   sudo sysctl -w vm.max_map_count=262144
+# =============================================================================================
+
+# ---------- shared fragments ----------
+# Container stdout/stderr -> Fluent Bit (forward protocol) -> Elasticsearch -> Kibana.
+# `fluentd-address` is resolved by the docker daemon on the host, hence the published port 24224.
+x-logging: &fluent-logging
+  driver: fluentd
+  options:
+    fluentd-address: "127.0.0.1:24224"
+    fluentd-async: "true"
+    fluentd-sub-second-precision: "true"
+    tag: "docker.{{.Name}}"
+
+x-s3-env: &s3-env
+  S3_ENDPOINT: ${S3_ENDPOINT:-minio:9000}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin123}
+  S3_INSECURE: ${S3_INSECURE:-true}
+  MIMIR_BLOCKS_BUCKET: ${MIMIR_BLOCKS_BUCKET:-mimir-blocks}
+  MIMIR_RULER_BUCKET: ${MIMIR_RULER_BUCKET:-mimir-ruler}
+
+services:
+  # ===========================================================================================
+  # APPLICATION
+  # ===========================================================================================
+
+  mongodb:
+    image: mongo:8.0
+    container_name: invoice-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?copy .env.example to .env and set MONGO_ROOT_PASSWORD}
+    volumes:
+      - mongodb-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet -u \"$$MONGO_INITDB_ROOT_USERNAME\" -p \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' | grep -q 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      - fluent-bit
+    logging: *fluent-logging
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    image: mern-invoice/api:2.0.0
+    container_name: invoice-api
+    restart: unless-stopped
+    # hard limits make "CPU % / memory % of limit" (dashboards + the 40% alerts) meaningful
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    environment:
+      NODE_ENV: production
+      PORT: "1997"
+      LOG_LEVEL: ${LOG_LEVEL:-http}
+      MONGO_URI: mongodb://${MONGO_ROOT_USER:-root}:${MONGO_ROOT_PASSWORD}@mongodb:27017/?authSource=admin
+      DB_NAME: ${DB_NAME:-invoice}
+      DOMAIN: ${DOMAIN:-http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3000}
+      JWT_ACCESS_SECRET_KEY: ${JWT_ACCESS_SECRET_KEY:?set JWT_ACCESS_SECRET_KEY in .env}
+      JWT_REFRESH_SECRET_KEY: ${JWT_REFRESH_SECRET_KEY:?set JWT_REFRESH_SECRET_KEY in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
+      # ---- e-mail: Gmail SMTP (App Password) ----
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SENDER_EMAIL: ${SENDER_EMAIL:-}
+      # ---- optional integrations ----
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_CALLBACK_URL: ${GOOGLE_CALLBACK_URL:-auth/google/redirect}
+      CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME:-}
+      CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY:-}
+      CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET:-}
+      # test hook (only tests/docker-compose.tests.yml sets it): accounts are created already verified
+      E2E_AUTO_VERIFY: ${E2E_AUTO_VERIFY:-false}
+      # ---- rate limits (lifted by tests/docker-compose.tests.yml for load tests) ----
+      RATE_LIMIT_API_MAX: ${RATE_LIMIT_API_MAX:-100}
+      RATE_LIMIT_LOGIN_MAX: ${RATE_LIMIT_LOGIN_MAX:-20}
+      # ---- OpenTelemetry (auto-instrumentation is preloaded in the image CMD) ----
+      OTEL_SERVICE_NAME: invoice-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_always_on}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+      fluent-bit:
+        condition: service_started
+    logging: *fluent-logging
+
+  web:
+    build:
+      context: ./client
+      args:
+        VITE_API_URL: /api/v1
+    image: mern-invoice/web:2.0.0
+    container_name: invoice-web
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    ports:
+      - "8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+      fluent-bit:
+        condition: service_started
+    logging: *fluent-logging
+
+  # ----- optional tools -----
+  mongo-express:
+    image: mongo-express:1.0.2-20
+    container_name: invoice-mongo-express
+    profiles: ["tools"]
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_ROOT_USER:-root}:${MONGO_ROOT_PASSWORD}@mongodb:27017/?authSource=admin
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USER:-admin}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD:-change-me}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  # local SMTP sink: set SMTP_HOST=mailhog SMTP_PORT=1025 SMTP_USER= SMTP_PASS= in .env to use it instead of Gmail
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: invoice-mailhog
+    profiles: ["mailhog"]
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  # ===========================================================================================
+  # LOGGING: Fluent Bit -> Elasticsearch -> Kibana
+  # ===========================================================================================
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.0
+    container_name: invoice-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"       # dev only: enable TLS + auth before exposing this
+      xpack.ml.enabled: "false"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -Eq '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  # one-shot: ILM retention + index template (idempotent)
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.0
+    container_name: invoice-es-setup
+    entrypoint: ["/bin/sh", "/setup/setup.sh"]
+    environment:
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+    volumes:
+      - ./observability/elasticsearch/setup.sh:/setup/setup.sh:ro
+      - ./observability/elasticsearch/ilm-policy.json:/setup/ilm-policy.json:ro
+      - ./observability/elasticsearch/index-template.json:/setup/index-template.json:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: "no"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.18.0
+    container_name: invoice-kibana
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      SERVER_PUBLICBASEURL: http://localhost:5601
+      TELEMETRY_ENABLED: "false"
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY:-a7f3c1d9e2b84f6a9c0d5e7b1a3f8c2d}
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # one-shot: data view "Invoice App logs" + saved searches (idempotent)
+  kibana-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.0
+    container_name: invoice-kibana-setup
+    entrypoint: ["/bin/sh", "/setup/setup.sh"]
+    environment:
+      KIBANA_URL: http://kibana:5601
+    volumes:
+      - ./observability/kibana/setup.sh:/setup/setup.sh:ro
+      - ./observability/kibana/data-view.json:/setup/data-view.json:ro
+      - ./observability/kibana/saved-objects.ndjson:/setup/saved-objects.ndjson:ro
+    depends_on:
+      kibana:
+        condition: service_healthy
+    restart: "no"
+
+  fluent-bit:
+    image: fluent/fluent-bit:4.0.8
+    container_name: invoice-fluent-bit
+    restart: unless-stopped
+    ports:
+      - "24224:24224"          # forward input: the docker log driver connects to this host port
+      - "24224:24224/udp"
+      - "2020:2020"            # health + Prometheus metrics
+    volumes:
+      - ./observability/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./observability/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - fluent-bit-buffer:/var/log/flb-storage
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+
+  # ===========================================================================================
+  # METRICS: OpenTelemetry Collector -> Mimir (S3) -> Grafana
+  # ===========================================================================================
+
+  minio:
+    image: elestio/minio:latest
+    container_name: invoice-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: pgsty/mc:latest
+    container_name: invoice-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin123}
+      BUCKETS: "${MIMIR_BLOCKS_BUCKET:-mimir-blocks} ${MIMIR_RULER_BUCKET:-mimir-ruler}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY"
+        for b in $$BUCKETS; do mc mb --ignore-existing "local/$$b"; done
+        mc ls local
+    restart: "no"
+
+  # Mimir runs as uid 10001; a fresh named volume is root-owned
+  init-permissions:
+    image: busybox:1.36
+    container_name: invoice-init-permissions
+    user: root
+    command: ["sh", "-c", "chown -R 10001:10001 /mimir"]
+    volumes:
+      - mimir-data:/mimir
+    restart: "no"
+
+  mimir:
+    image: grafana/mimir:2.16.0
+    container_name: invoice-mimir
+    restart: unless-stopped
+    command: ["-config.file=/etc/mimir/mimir.yaml", "-config.expand-env=true"]
+    environment:
+      <<: *s3-env
+    ports:
+      - "9009:9009"
+    volumes:
+      - ./observability/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir-data:/data
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      init-permissions:
+        condition: service_completed_successfully
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.119.0
+    container_name: invoice-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      - ./observability/otel-collector/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - mimir
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: invoice-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # ---- SMTP for Grafana-managed alerts: Gmail (same App Password as the app by default) ----
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: ${GRAFANA_SMTP_HOST:-smtp.gmail.com:587}
+      GF_SMTP_USER: ${SMTP_USER:-}
+      GF_SMTP_PASSWORD: ${SMTP_PASS:-}
+      GF_SMTP_FROM_ADDRESS: ${SMTP_USER:-grafana-alerts@invoice.com}
+      GF_SMTP_FROM_NAME: Invoice App Alerts
+      GF_SMTP_STARTTLS_POLICY: ${GRAFANA_SMTP_STARTTLS_POLICY:-MandatoryStartTLS}
+      # recipients of the provisioned contact point
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-shimdi247@gmail.com}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - mimir
+
+  # ----- exporters scraped by the collector -----
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: invoice-cadvisor
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.service
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: invoice-node-exporter
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: invoice-blackbox-exporter
+    restart: unless-stopped
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./observability/blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+
+volumes:
+  mongodb-data:
+  elasticsearch-data:
+  fluent-bit-buffer:
+  minio-data:
+  mimir-data:
+  grafana-data:

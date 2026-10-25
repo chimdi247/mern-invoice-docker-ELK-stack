@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  # Metrics: Grafana Mimir (Prometheus compatible query API). Mimir stores its blocks in S3 (MinIO).
+  - name: Mimir
+    uid: mimir
+    type: prometheus
+    access: proxy
+    url: http://mimir:9009/prometheus
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      prometheusType: Mimir
+      timeInterval: 15s
